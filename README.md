@@ -167,7 +167,6 @@ Write unit + integration tests to avoid production bugs.
 - **Node.js + Express**
 - **MongoDB (Mongoose)**
 - **JWT for Auth**
-- **Redis (caching + workers)**
 - **Bull/Agenda (background jobs)**
 - **Stripe/Razorpay (payments)**
 

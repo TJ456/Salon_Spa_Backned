@@ -1,397 +1,332 @@
-/**
- * ===================================
- * BILLING SERVICE - SERVICE LAYER
- * ===================================
- *
- * This file handles all business logic for billing, invoicing, and payment processing in the salon/spa system.
- * It manages invoice generation, payment tracking, financial reporting, and integration with payment gateways.
- *
- * Main Functions:
- * - Invoice creation, modification, and management
- * - Payment processing and tracking
- * - Financial reporting and analytics
- * - Tax calculations and compliance
- * - Billing automation and recurring payments
- * - Integration with accounting systems
- */
+// ======================================
+// BILLING SERVICE - SERVICE LAYER
+// ======================================
+const Invoice = require("../models/invoice");
+const Appointment = require("../models/appointment");
+const Customer = require("../models/customer");
+const Service = require("../models/service");
+const WalletTransaction = require("../models/walletTransaction");
+const Payment = require("../models/payment");
 
-// ========================================
-// STEP 1: ✅ IMPORT REQUIRED MODULES AND DEPENDENCIES
-// ========================================
-// Import database models for billing operations
-// - Invoice model for invoice management
-// - Customer model for customer billing information
-// - Service model for service pricing and details
-// - Appointment model for appointment billing
-// - WalletTransaction model for wallet operations
-// - Payment model for payment tracking
+// Utility libraries
+const { addDays, format } = require("date-fns");
+// PDF generation, email, payment SDKs would go here (placeholders)
 
-// Import PDF generation libraries (PDFKit, jsPDF, or Puppeteer)
-// Import Excel generation libraries (ExcelJS, XLSX)
-// Import payment gateway SDKs (Stripe, PayPal, Razorpay)
-// Import tax calculation services
-// Import email services for invoice delivery
-// Import accounting system integrations (QuickBooks, Xero)
+class BillingService {
+  // ==============================
+  // INVOICE RETRIEVAL
+  // ==============================
+  
+  async getInvoices(salonId, filters = {}, page = 1, limit = 10) {
+    const query = { tenantId: salonId, ...filters };
 
-// ========================================
-// STEP 2: ✅ CREATE BILLING SERVICE CLASS
-// ========================================
-// Define BillingService class to encapsulate all billing methods
-// Initialize payment gateway connections
-// Set up tax calculation services
-// Configure PDF and document generation
-// Initialize email service for invoice delivery
+    // Add search functionality
+    if (filters.search) {
+      query.$or = [
+        { invoiceNumber: { $regex: filters.search, $options: 'i' } },
+        { 'customerId.name': { $regex: filters.search, $options: 'i' } }
+      ];
+      delete query.search;
+    }
 
-// ========================================
-// STEP 3: ✅ INVOICE MANAGEMENT METHODS
-// ========================================
+    const invoices = await Invoice.find(query)
+      .populate("customerId", "name email phone")
+      .populate("appointmentId", "scheduledAt")
+      .populate("lineItems.serviceId", "name price")
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
 
-// METHOD: getInvoices(salonId, filters, pagination)
-// - Retrieve invoices with advanced filtering options
-// - Support filters: status, customer, date range, amount range, payment method
-// - Implement pagination for large invoice lists
-// - Include customer and service information
-// - Sort invoices by date, amount, or status
-// - Return formatted invoice data with totals
+    const total = await Invoice.countDocuments(query);
 
-// METHOD: getInvoiceById(invoiceId, salonId)
-// - Fetch detailed invoice information by ID
-// - Validate salon ownership and access permissions
-// - Include complete customer and service details
-// - Show payment history and transaction records
-// - Include invoice generation and modification history
+    return {
+      invoices,
+      meta: {
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+        total,
+        hasNextPage: page * limit < total,
+        hasPrevPage: page > 1
+      }
+    };
+  }
 
-// METHOD: createInvoice(invoiceData)
-// - Generate new invoice with automatic numbering
-// - Calculate line items, subtotals, and taxes
-// - Apply discounts, promotions, and loyalty benefits
-// - Validate customer information and billing address
-// - Set payment terms and due dates
-// - Generate invoice PDF automatically
-// - Send invoice notification to customer
+  async getInvoiceById(invoiceId, salonId) {
+    return await Invoice.findOne({ _id: invoiceId, tenantId: salonId })
+      .populate("customerId", "name email phone address")
+      .populate("appointmentId", "scheduledAt serviceIds")
+      .populate("lineItems.serviceId", "name price description")
+      .populate("payments", "amount method status createdAt");
+  }
 
-// METHOD: createInvoiceFromAppointment(appointmentId)
-// - Generate invoice automatically from completed appointment
-// - Extract services and pricing from appointment
-// - Apply any appointment-specific discounts
-// - Include additional charges or modifications
-// - Set appropriate payment terms
-// - Link invoice to original appointment
+  async createInvoice(invoiceData) {
+    // Generate invoice number
+    const invoiceNumber = await this.generateInvoiceNumber(invoiceData.tenantId);
 
-// ========================================
-// STEP 4: ✅ INVOICE MODIFICATION AND UPDATES
-// ========================================
+    // Calculate totals
+    const totals = this.calculateInvoiceTotals(invoiceData.lineItems, invoiceData.taxRate || 0, invoiceData.discounts || []);
 
-// METHOD: updateInvoice(invoiceId, updateData, salonId)
-// - Modify existing invoice details
-// - Recalculate totals when line items change
-// - Validate business rules for invoice modifications
-// - Track invoice modification history
-// - Update payment status and terms if needed
-// - Regenerate PDF with changes
-// - Send update notifications if required
+    const invoice = new Invoice({
+      ...invoiceData,
+      invoiceNumber,
+      ...totals,
+      status: "unpaid",
+      dueDate: addDays(new Date(), 30), // 30 days payment term
+      createdAt: new Date()
+    });
 
-// METHOD: addLineItemToInvoice(invoiceId, lineItem, salonId)
-// - Add new service or product to existing invoice
-// - Recalculate invoice totals and taxes
-// - Validate service pricing and availability
-// - Update invoice generation date if needed
-// - Maintain audit trail of changes
+    await invoice.save();
 
-// METHOD: removeLineItemFromInvoice(invoiceId, lineItemId, salonId)
-// - Remove service or product from invoice
-// - Recalculate totals and adjust taxes
-// - Validate removal permissions and business rules
-// - Update invoice modification history
-// - Handle partial payment scenarios
+    // Auto-populate for return
+    await invoice.populate([
+      { path: "customerId", select: "name email phone" },
+      { path: "lineItems.serviceId", select: "name price" }
+    ]);
 
-// ========================================
-// STEP 5: ✅ PAYMENT PROCESSING METHODS
-// ========================================
+    return invoice;
+  }
 
-// METHOD: processPayment(paymentData)
-// - Handle payment processing for invoices
-// - Integrate with multiple payment gateways
-// - Support various payment methods (card, cash, wallet)
-// - Validate payment amounts and invoice status
-// - Update invoice status and payment records
-// - Generate payment receipts and confirmations
-// - Send payment confirmation notifications
+  async createInvoiceFromAppointment(appointmentId) {
+    const appointment = await Appointment.findById(appointmentId).populate("serviceIds customerId");
+    if (!appointment) throw new Error("Appointment not found");
 
-// METHOD: processPartialPayment(invoiceId, amount, paymentMethod)
-// - Handle partial payments on invoices
-// - Update remaining balance and payment status
-// - Track multiple payment installments
-// - Calculate payment allocation across line items
-// - Update invoice aging and due date calculations
+    const lineItems = appointment.serviceIds.map(service => ({
+      serviceId: service._id,
+      name: service.name,
+      price: service.price,
+      quantity: 1
+    }));
 
-// METHOD: processRefund(invoiceId, refundAmount, reason)
-// - Handle refund processing for paid invoices
-// - Integrate with payment gateway refund APIs
-// - Calculate refund amounts and fees
-// - Update invoice status and payment records
-// - Generate refund receipts and documentation
-// - Send refund confirmation notifications
+    const invoiceData = {
+      salonId: appointment.tenantId,
+      customerId: appointment.customerId._id,
+      appointmentId: appointment._id,
+      lineItems,
+      taxRate: 0.18 // example
+    };
 
-// METHOD: voidInvoice(invoiceId, reason, salonId)
-// - Cancel unpaid invoice and mark as void
-// - Handle business rules for invoice cancellation
-// - Update customer account and payment history
-// - Process any required notifications
-// - Maintain audit trail for compliance
+    return await this.createInvoice(invoiceData);
+  }
 
-// ========================================
-// STEP 6: ✅ FINANCIAL CALCULATIONS AND TAX HANDLING
-// ========================================
+  async updateInvoice(invoiceId, updateData, salonId) {
+    const invoice = await Invoice.findOneAndUpdate(
+      { _id: invoiceId, salonId },
+      updateData,
+      { new: true }
+    );
+    // TODO: regenerate PDF if needed
+    return invoice;
+  }
 
-// METHOD: calculateInvoiceTotals(lineItems, taxRate, discounts)
-// - Calculate subtotals for all line items
-// - Apply line-item level discounts and promotions
-// - Calculate applicable taxes based on location and services
-// - Handle tax exemptions and special rates
-// - Calculate final total amount
-// - Round amounts according to currency rules
+  // ==============================
+  // PAYMENT PROCESSING
+  // ==============================
 
-// METHOD: calculateTaxes(invoiceData, customerLocation)
-// - Determine applicable tax rates based on location
-// - Handle multiple tax types (sales tax, service tax, VAT)
-// - Calculate tax amounts for each line item
-// - Apply tax exemptions for qualified customers
-// - Generate tax breakdown for reporting
+  async processPayment(paymentData) {
+    const invoice = await Invoice.findById(paymentData.invoiceId);
+    if (!invoice) throw new Error("Invoice not found");
 
-// METHOD: applyDiscounts(invoiceData, discountCodes)
-// - Apply percentage and fixed amount discounts
-// - Validate discount codes and expiration dates
-// - Handle customer-specific discounts and loyalty benefits
-// - Calculate maximum discount limits
-// - Track discount usage and effectiveness
+    // Calculate total paid amount
+    const existingPayments = await Payment.find({ invoiceId: paymentData.invoiceId });
+    const totalPaid = existingPayments.reduce((sum, p) => sum + p.amount, 0) + paymentData.amount;
 
-// METHOD: calculateLoyaltyBenefits(customerId, invoiceData)
-// - Apply loyalty program benefits and points redemption
-// - Calculate earned points for current transaction
-// - Apply tier-based discounts and benefits
-// - Update customer loyalty status and points balance
-// - Generate loyalty program reports
+    if (totalPaid > invoice.totalAmount) {
+      throw new Error("Payment amount exceeds invoice total");
+    }
 
-// ========================================
-// STEP 7: ✅ RECURRING BILLING AND AUTOMATION
-// ========================================
+    const payment = new Payment({
+      ...paymentData,
+      status: "completed",
+      processedAt: new Date()
+    });
+    await payment.save();
 
-// METHOD: createRecurringBilling(customerId, billingPlan)
-// - Set up recurring billing for subscription services
-// - Define billing frequency and amounts
-// - Configure automatic payment processing
-// - Set up billing cycle dates and reminders
-// - Handle billing plan modifications and cancellations
+    // Update invoice status
+    invoice.payments.push(payment._id);
+    invoice.paidAmount = totalPaid;
+    invoice.status = totalPaid >= invoice.totalAmount ? "paid" : "partial";
+    if (invoice.status === "paid") {
+      invoice.paidAt = new Date();
+    }
+    await invoice.save();
 
-// METHOD: processRecurringBillings()
-// - Automatically process scheduled recurring bills
-// - Generate invoices for subscription customers
-// - Attempt automatic payment processing
-// - Handle failed payments and retry logic
-// - Send billing notifications and reminders
+    return payment;
+  }
 
-// METHOD: updateRecurringBilling(billingPlanId, updates)
-// - Modify existing recurring billing arrangements
-// - Handle plan upgrades and downgrades
-// - Prorate billing amounts for mid-cycle changes
-// - Update payment methods and billing information
-// - Notify customers of billing changes
+  async processPartialPayment(invoiceId, amount, method) {
+    return await this.processPayment({ invoiceId, amount, method });
+  }
 
-// ========================================
-// STEP 8: ✅ DOCUMENT GENERATION AND DELIVERY
-// ========================================
+  async processRefund(invoiceId, refundAmount, reason) {
+    // Placeholder for refund logic
+    return { invoiceId, refundAmount, reason, status: "refunded" };
+  }
 
-// METHOD: generateInvoicePDF(invoiceId, salonId)
-// - Create professional PDF invoice documents
-// - Include salon branding and logo
-// - Format invoice layout with proper styling
-// - Include all line items, taxes, and totals
-// - Add payment terms and instructions
-// - Include QR codes for easy payment
-// - Support multiple languages and currencies
+  async voidInvoice(invoiceId, reason, salonId) {
+    return await Invoice.findOneAndUpdate(
+      { _id: invoiceId, salonId },
+      { status: "void", voidReason: reason },
+      { new: true }
+    );
+  }
 
-// METHOD: generateReceiptPDF(paymentId)
-// - Create payment receipt documents
-// - Include payment details and transaction information
-// - Show payment method and confirmation numbers
-// - Include refund and exchange policies
-// - Add customer and salon contact information
+  // ==============================
+  // CALCULATIONS
+  // ==============================
 
-// METHOD: sendInvoiceByEmail(invoiceId, emailOptions)
-// - Email invoice PDF to customers
-// - Include personalized email message
-// - Add payment links and online payment options
-// - Track email delivery and open rates
-// - Handle email delivery failures and retries
+  calculateInvoiceTotals(lineItems, taxRate = 0, discounts = []) {
+    const subtotal = lineItems.reduce((sum, item) => sum + (item.price * (item.quantity || 1)), 0);
+    const discountAmount = discounts.reduce((sum, d) => sum + (d.amount || 0), 0);
+    const taxableAmount = Math.max(0, subtotal - discountAmount);
+    const taxAmount = taxableAmount * taxRate;
+    const totalAmount = taxableAmount + taxAmount;
 
-// METHOD: bulkInvoiceGeneration(invoiceIds)
-// - Generate multiple invoices in batch
-// - Create combined PDF packages
-// - Process bulk email delivery
-// - Generate batch processing reports
-// - Handle errors and exceptions in bulk operations
+    return {
+      subtotal: parseFloat(subtotal.toFixed(2)),
+      discountAmount: parseFloat(discountAmount.toFixed(2)),
+      taxAmount: parseFloat(taxAmount.toFixed(2)),
+      totalAmount: parseFloat(totalAmount.toFixed(2))
+    };
+  }
 
-// ========================================
-// STEP 9: ✅ FINANCIAL REPORTING AND ANALYTICS
-// ========================================
+  async generateInvoiceNumber(tenantId) {
+    const today = new Date();
+    const year = today.getFullYear();
+    const month = String(today.getMonth() + 1).padStart(2, '0');
 
-// METHOD: getBillingAnalytics(salonId, period)
-// - Generate comprehensive billing analytics
-// - Calculate total revenue and average invoice values
-// - Analyze payment patterns and collection rates
-// - Track overdue invoices and aging reports
-// - Measure payment method effectiveness
-// - Provide financial performance insights
+    const count = await Invoice.countDocuments({
+      tenantId,
+      createdAt: {
+        $gte: new Date(year, today.getMonth(), 1),
+        $lt: new Date(year, today.getMonth() + 1, 1)
+      }
+    });
 
-// METHOD: getDailySalesReport(salonId, date)
-// - Generate daily sales and revenue reports
-// - Include payment method breakdown
-// - Show service-wise revenue distribution
-// - Calculate daily targets and achievements
-// - Include cash flow and payment timing
+    return `INV-${year}${month}-${String(count + 1).padStart(4, '0')}`;
+  }
 
-// METHOD: getMonthlySalesReport(salonId, year, month)
-// - Create monthly financial summary reports
-// - Show revenue trends and growth patterns
-// - Calculate monthly recurring revenue (MRR)
-// - Analyze customer payment behavior
-// - Generate month-over-month comparisons
+  // ==============================
+  // RECURRING BILLING PLACEHOLDER
+  // ==============================
+  async createRecurringBilling(customerId, billingPlan) {
+    // TODO: implement recurring billing logic
+    return { customerId, billingPlan, status: "scheduled" };
+  }
 
-// METHOD: getPaymentAnalytics(salonId, period)
-// - Analyze payment processing metrics
-// - Track payment success and failure rates
-// - Calculate average payment processing times
-// - Measure payment method preferences
-// - Identify payment optimization opportunities
+  async processRecurringBillings() {
+    // TODO: process scheduled recurring bills
+    return [];
+  }
 
-// ========================================
-// STEP 10: ✅ ACCOUNTS RECEIVABLE MANAGEMENT
-// ========================================
+  // ==============================
+  // DOCUMENT GENERATION PLACEHOLDER
+  // ==============================
+  async generateInvoicePDF(invoiceId) {
+    // TODO: generate PDF for invoice
+    return `PDF for invoice ${invoiceId} generated`;
+  }
 
-// METHOD: getAgedReceivables(salonId)
-// - Generate accounts receivable aging reports
-// - Categorize outstanding invoices by age
-// - Calculate collection rates and DSO (Days Sales Outstanding)
-// - Identify customers with overdue payments
-// - Provide collection recommendations
+  async sendInvoiceByEmail(invoiceId, emailOptions) {
+    // TODO: integrate email service
+    return `Invoice ${invoiceId} sent to ${emailOptions.to}`;
+  }
 
-// METHOD: sendPaymentReminders(salonId)
-// - Automatically send payment reminder emails
-// - Customize reminder messages based on overdue period
-// - Track reminder effectiveness and response rates
-// - Escalate reminders based on customer payment history
-// - Handle payment plan negotiations
+  // ==============================
+  // FINANCIAL REPORTING & ANALYTICS
+  // ==============================
+  async getBillingAnalytics(salonId, startDate = null, endDate = null) {
+    const query = { tenantId: salonId };
+    if (startDate && endDate) {
+      query.createdAt = { $gte: startDate, $lte: endDate };
+    }
 
-// METHOD: writeOffBadDebt(invoiceId, reason, salonId)
-// - Mark uncollectible invoices as bad debt
-// - Update financial records and tax reporting
-// - Maintain audit trail for write-offs
-// - Generate bad debt reports for management
-// - Handle customer account status updates
+    const analytics = await Invoice.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: null,
+          totalRevenue: { $sum: "$totalAmount" },
+          totalInvoices: { $sum: 1 },
+          paidInvoices: { $sum: { $cond: [{ $eq: ["$status", "paid"] }, 1, 0] } },
+          pendingAmount: { $sum: { $cond: [{ $ne: ["$status", "paid"] }, "$totalAmount", 0] } }
+        }
+      }
+    ]);
 
-// ========================================
-// STEP 11: ✅ PAYMENT GATEWAY INTEGRATION
-// ========================================
+    const result = analytics[0] || { totalRevenue: 0, totalInvoices: 0, paidInvoices: 0, pendingAmount: 0 };
 
-// METHOD: initializePaymentGateway(gatewayType, credentials)
-// - Set up connections to payment processors
-// - Configure API keys and merchant accounts
-// - Set up webhook endpoints for payment notifications
-// - Initialize supported payment methods
-// - Configure currency and regional settings
+    return {
+      ...result,
+      averageInvoiceValue: result.totalInvoices > 0 ? (result.totalRevenue / result.totalInvoices).toFixed(2) : 0,
+      collectionRate: result.totalInvoices > 0 ? ((result.paidInvoices / result.totalInvoices) * 100).toFixed(2) : 0
+    };
+  }
 
-// METHOD: processCardPayment(paymentData)
-// - Process credit/debit card payments
-// - Handle payment authorization and capture
-// - Implement 3D Secure authentication
-// - Store payment tokens for future use
-// - Handle payment failures and error responses
+  async getDailySalesReport(salonId, date) {
+    const startDate = new Date(date);
+    startDate.setHours(0, 0, 0, 0);
+    const endDate = new Date(date);
+    endDate.setHours(23, 59, 59, 999);
 
-// METHOD: processWalletPayment(customerId, amount, description)
-// - Process payments using customer wallet balance
-// - Validate wallet balance and transaction limits
-// - Create wallet transaction records
-// - Update customer wallet balance
-// - Generate wallet payment receipts
+    return await Invoice.find({
+      tenantId: salonId,
+      createdAt: { $gte: startDate, $lte: endDate }
+    })
+    .populate("customerId", "name")
+    .populate("appointmentId", "scheduledAt")
+    .sort({ createdAt: -1 });
+  }
 
-// METHOD: handlePaymentWebhooks(webhookData)
-// - Process payment gateway notifications
-// - Update payment status in real-time
-// - Handle successful and failed payment events
-// - Process refund and chargeback notifications
-// - Maintain payment transaction logs
+  async getMonthlySalesReport(salonId, year, month) {
+    const startDate = new Date(year, month - 1, 1);
+    const endDate = new Date(year, month, 0, 23, 59, 59, 999);
 
-// ========================================
-// STEP 12: ✅ ACCOUNTING SYSTEM INTEGRATION
-// ========================================
+    const monthlyData = await Invoice.aggregate([
+      {
+        $match: {
+          tenantId: salonId,
+          createdAt: { $gte: startDate, $lte: endDate }
+        }
+      },
+      {
+        $group: {
+          _id: { $dayOfMonth: "$createdAt" },
+          dailyRevenue: { $sum: "$totalAmount" },
+          invoiceCount: { $sum: 1 }
+        }
+      },
+      { $sort: { _id: 1 } }
+    ]);
 
-// METHOD: syncWithAccountingSystem(accountingSystem)
-// - Integrate with popular accounting software
-// - Sync invoices, payments, and customer data
-// - Map chart of accounts and tax codes
-// - Handle data format conversions
-// - Maintain sync logs and error handling
+    return monthlyData;
+  }
 
-// METHOD: exportToQuickBooks(salonId, dateRange)
-// - Export financial data to QuickBooks format
-// - Map customers, services, and transactions
-// - Generate QBO import files
-// - Handle data validation and formatting
-// - Provide import instructions and support
+  // Tax calculation helper
+  calculateTax(amount, taxRate = 0.18) {
+    return parseFloat((amount * taxRate).toFixed(2));
+  }
 
-// METHOD: generateTaxReports(salonId, taxPeriod)
-// - Create tax compliance reports
-// - Calculate tax liabilities and collections
-// - Generate tax filing documents
-// - Support multiple tax jurisdictions
-// - Provide audit trail documentation
+  // Payment tracking
+  async getPaymentHistory(invoiceId) {
+    return await Payment.find({ invoiceId })
+      .sort({ createdAt: -1 });
+  }
 
-// ========================================
-// STEP 13: ✅ FINANCIAL COMPLIANCE AND AUDIT
-// ========================================
+  // Outstanding invoices
+  async getOutstandingInvoices(salonId) {
+    return await Invoice.find({
+      tenantId: salonId,
+      status: { $in: ["unpaid", "partial"] },
+      dueDate: { $lt: new Date() }
+    })
+    .populate("customerId", "name email phone")
+    .sort({ dueDate: 1 });
+  }
 
-// METHOD: generateAuditTrail(salonId, dateRange)
-// - Create comprehensive audit logs
-// - Track all financial transactions and modifications
-// - Include user actions and timestamp information
-// - Generate tamper-proof audit reports
-// - Support regulatory compliance requirements
+  // ==============================
+  // EXPORT SERVICE INSTANCE
+  // ==============================
+}
 
-// METHOD: validateFinancialData(salonId)
-// - Perform data integrity checks
-// - Validate invoice numbering sequences
-// - Check payment and refund calculations
-// - Verify tax calculation accuracy
-// - Identify and report data inconsistencies
-
-// METHOD: archiveFinancialRecords(salonId, archivePeriod)
-// - Archive old financial records for compliance
-// - Maintain data retention policies
-// - Ensure data accessibility for audits
-// - Compress and secure archived data
-// - Generate archival reports and indexes
-
-// ========================================
-// STEP 14: ✅ ERROR HANDLING AND VALIDATION
-// ========================================
-
-// Implement comprehensive error handling for:
-// - Invalid invoice data and calculations
-// - Payment processing failures and timeouts
-// - Tax calculation errors and compliance issues
-// - Document generation and delivery failures
-// - Gateway integration and API errors
-// - Customer validation and credit check failures
-// - Currency conversion and rounding errors
-
-// ========================================
-// STEP 15: ✅ EXPORT SERVICE INSTANCE
-// ========================================
-
-// Create and export new instance of BillingService
-// Initialize payment gateway connections
-// Set up document generation services
-// Configure email and notification services
-// Initialize accounting system integrations
-// Set up monitoring and logging systems
+module.exports = new BillingService();

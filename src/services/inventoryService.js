@@ -1,424 +1,418 @@
-/**
- * =======================================
- * INVENTORY SERVICE - SERVICE LAYER
- * =======================================
- *
- * This file handles all business logic for inventory management in the salon/spa system.
- * It manages product inventory, stock levels, supplier relationships, and inventory analytics.
- *
- * Main Functions:
- * - Inventory item CRUD operations and management
- * - Stock level monitoring and automatic reordering
- * - Supplier management and purchase order processing
- * - Inventory analytics and reporting
- * - Product usage tracking and cost analysis
- * - Inventory optimization and forecasting
- */
+// ======================================
+// INVENTORY SERVICE - SERVICE LAYER
+// ======================================
 
-// ========================================
-// STEP 1: ✅ IMPORT REQUIRED MODULES AND DEPENDENCIES
-// ========================================
-// Import database models for inventory operations
-// - Inventory model for product and stock management
-// - Supplier model for vendor relationship management
-// - PurchaseOrder model for ordering and receiving
-// - InventoryMovement model for stock movement tracking
-// - Service model for service-inventory relationships
-// - Appointment model for usage tracking
+const Inventory = require("../models/inventory");
+const Supplier = require("../models/supplier");
+const PurchaseOrder = require("../models/purchaseOrder");
+const InventoryMovement = require("../models/inventoryMovement");
+const Service = require("../models/service");
+const Appointment = require("../models/appointment");
 
-// Import barcode scanning and generation libraries
-// Import Excel/CSV import/export utilities
-// Import email services for supplier communication
-// Import analytics and forecasting libraries
-// Import image processing for product photos
+// Utilities
+const { format } = require("date-fns");
 
-// ========================================
-// STEP 2: ✅ CREATE INVENTORY SERVICE CLASS
-// ========================================
-// Define InventoryService class to encapsulate all inventory methods
-// Initialize barcode scanning and generation services
-// Set up supplier communication channels
-// Configure inventory analytics and forecasting tools
-// Initialize file upload and image processing
+class InventoryService {
+  // ==============================
+  // INVENTORY ITEM MANAGEMENT
+  // ==============================
+  
+  async getInventory(salonId, filters = {}, page = 1, limit = 10, search = null) {
+    const query = { tenantId: salonId, ...filters };
 
-// ========================================
-// STEP 3: ✅ INVENTORY ITEM MANAGEMENT
-// ========================================
+    if (search) {
+      const searchRegex = { $regex: search, $options: "i" };
+      query.$or = [
+        { name: searchRegex },
+        { description: searchRegex },
+        { category: searchRegex },
+        { sku: searchRegex }
+      ];
+    }
 
-// METHOD: getInventory(salonId, filters, pagination)
-// - Retrieve inventory items with advanced filtering
-// - Support filters: category, status, supplier, stock level, expiration date
-// - Implement pagination for large inventory lists
-// - Include stock movement history and analytics
-// - Sort items by various criteria (name, quantity, value, last updated)
-// - Return formatted inventory data with calculations
+    const items = await Inventory.find(query)
+      .populate("supplierId", "name contact email")
+      .sort({ updatedAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
 
-// METHOD: getInventoryById(itemId, salonId)
-// - Fetch detailed inventory item information
-// - Validate salon access and item ownership
-// - Include complete stock movement history
-// - Show supplier information and purchase history
-// - Include usage analytics and cost calculations
-// - Display related services and consumption patterns
+    const total = await Inventory.countDocuments(query);
 
-// METHOD: createInventory(itemData, salonId)
-// - Add new inventory item to system
-// - Validate item information and required fields
-// - Generate unique item codes and barcodes
-// - Set up initial stock levels and reorder points
-// - Create supplier relationships and pricing
-// - Initialize item analytics and tracking
-// - Set up automatic reorder rules if applicable
+    return {
+      items,
+      meta: {
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+        total,
+        hasNextPage: page * limit < total,
+        hasPrevPage: page > 1,
+      },
+    };
+  }
 
-// METHOD: updateInventory(itemId, updateData, salonId)
-// - Modify existing inventory item details
-// - Validate updated information and business rules
-// - Handle price changes and supplier updates
-// - Update reorder points and stock thresholds
-// - Maintain item modification audit trail
-// - Trigger notifications for significant changes
+  async getInventoryById(itemId, salonId) {
+    return await Inventory.findOne({ _id: itemId, tenantId: salonId })
+      .populate("supplierId", "name contact email")
+      .populate("movements")
+      .populate("servicesUsed");
+  }
 
-// ========================================
-// STEP 4: ✅ STOCK LEVEL MANAGEMENT
-// ========================================
+  async createInventory(data, salonId) {
+    const inventory = new Inventory({
+      ...data,
+      tenantId: salonId,
+      sku: data.sku || this.generateSKU(),
+      createdAt: new Date()
+    });
+    await inventory.save();
+    this.sendNotification(`Inventory item created: ${inventory.name}`);
+    return inventory;
+  }
 
-// METHOD: updateStock(itemId, quantity, type, reason, salonId, userId)
-// - Add or remove stock with detailed tracking
-// - Validate stock changes and movement reasons
-// - Create comprehensive stock movement records
-// - Update current stock levels atomically
-// - Calculate stock value changes
-// - Generate stock movement notifications
-// - Update reorder status and alerts
+  generateSKU() {
+    return 'SKU-' + Date.now() + '-' + Math.random().toString(36).substr(2, 5).toUpperCase();
+  }
 
-// METHOD: adjustStockLevels(adjustments, salonId, userId)
-// - Process bulk stock level adjustments
-// - Validate adjustment data and permissions
-// - Create detailed adjustment records
-// - Update multiple items atomically
-// - Generate adjustment reports and summaries
-// - Handle adjustment approval workflows
+  async updateInventory(itemId, updateData, salonId) {
+    const updated = await Inventory.findOneAndUpdate(
+      { _id: itemId, tenantId: salonId },
+      { ...updateData, updatedAt: new Date() },
+      { new: true }
+    );
+    this.sendNotification(`Inventory item updated: ${updated.name}`);
+    return updated;
+  }
 
-// METHOD: performStockCount(salonId, countData, userId)
-// - Conduct physical stock count verification
-// - Compare physical count with system quantities
-// - Identify and report stock discrepancies
-// - Generate stock variance reports
-// - Create adjustment entries for differences
-// - Update stock accuracy metrics
+  async deleteInventory(itemId, salonId) {
+    const deleted = await Inventory.findOneAndDelete({ _id: itemId, tenantId: salonId });
+    this.sendNotification(`Inventory item deleted: ${deleted?.name || itemId}`);
+    return deleted;
+  }
 
-// METHOD: setReorderPoints(itemId, minimumStock, maximumStock, reorderQuantity)
-// - Configure automatic reorder thresholds
-// - Validate reorder point logic and calculations
-// - Set up reorder quantity and supplier preferences
-// - Configure reorder notification rules
-// - Calculate optimal reorder points based on usage
-// - Enable automatic purchase order generation
+  // ==============================
+  // STOCK LEVEL MANAGEMENT
+  // ==============================
 
-// ========================================
-// STEP 5: ✅ INVENTORY ANALYTICS AND REPORTING
-// ========================================
+  async updateStock(itemId, quantity, type, reason, salonId, userId) {
+    const item = await Inventory.findOne({ _id: itemId, tenantId: salonId });
+    if (!item) throw new Error("Inventory item not found");
 
-// METHOD: getInventoryAnalytics(salonId, period)
-// - Generate comprehensive inventory analytics
-// - Calculate inventory turnover and velocity
-// - Analyze stock levels and utilization rates
-// - Track inventory value and cost trends
-// - Identify slow-moving and fast-moving items
-// - Generate inventory performance insights
+    const change = type === "add" ? quantity : -quantity;
+    const newStockLevel = item.stockLevel + change;
 
-// METHOD: getLowStockItems(salonId)
-// - Identify items below reorder points
-// - Prioritize items by criticality and usage
-// - Include supplier information and lead times
-// - Calculate reorder quantities and costs
-// - Generate low stock alerts and notifications
-// - Provide reorder recommendations
+    if (newStockLevel < 0) {
+      throw new Error("Insufficient stock available");
+    }
 
-// METHOD: getInventoryValuation(salonId, valuationMethod)
-// - Calculate total inventory value using different methods
-// - Support FIFO, LIFO, and weighted average costing
-// - Include dead stock and obsolete inventory
-// - Calculate inventory carrying costs
-// - Generate valuation reports for accounting
-// - Track inventory value trends over time
+    item.stockLevel = newStockLevel;
+    item.lastMovement = new Date();
+    await item.save();
 
-// METHOD: analyzeInventoryTurnover(salonId, period)
-// - Calculate inventory turnover rates by item and category
-// - Identify optimal stock levels and ordering patterns
-// - Analyze seasonal demand and usage patterns
-// - Generate turnover improvement recommendations
-// - Track turnover trends and benchmarks
-// - Identify overstocked and understocked items
+    const movement = new InventoryMovement({
+      itemId,
+      tenantId: salonId,
+      quantity: change,
+      type,
+      reason,
+      userId,
+      balanceAfter: newStockLevel,
+      createdAt: new Date(),
+    });
+    await movement.save();
 
-// ========================================
-// STEP 6: ✅ SUPPLIER AND PROCUREMENT MANAGEMENT
-// ========================================
+    // Check for low stock alerts
+    if (item.stockLevel <= item.minStock) {
+      this.sendLowStockAlert(item);
+    }
 
-// METHOD: manageSuppliers(salonId, supplierData)
-// - Add, update, and manage supplier information
-// - Track supplier performance and reliability
-// - Maintain supplier contact and pricing information
-// - Monitor supplier delivery times and quality
-// - Evaluate supplier relationships and contracts
-// - Generate supplier performance reports
+    this.sendNotification(
+      `Stock updated for ${item.name}: ${type} ${quantity} units. New balance: ${newStockLevel}`
+    );
+    return movement;
+  }
 
-// METHOD: createPurchaseOrder(salonId, orderData, userId)
-// - Generate purchase orders for inventory replenishment
-// - Include items, quantities, and pricing information
-// - Apply supplier-specific terms and conditions
-// - Calculate order totals including taxes and shipping
-// - Send purchase orders to suppliers electronically
-// - Track purchase order status and delivery
+  async adjustStockLevels(adjustments, salonId, userId) {
+    const results = [];
+    for (const adj of adjustments) {
+      const movement = await this.updateStock(
+        adj.itemId,
+        adj.quantity,
+        adj.type,
+        adj.reason,
+        salonId,
+        userId
+      );
+      results.push(movement);
+    }
+    return results;
+  }
 
-// METHOD: receivePurchaseOrder(orderId, receivingData, userId)
-// - Process incoming inventory deliveries
-// - Verify received quantities against purchase orders
-// - Update inventory stock levels automatically
-// - Record any discrepancies or quality issues
-// - Update supplier performance metrics
-// - Generate receiving reports and documentation
+  async performStockCount(salonId, countData, userId) {
+    const adjustments = [];
+    for (const { itemId, physicalCount } of countData) {
+      const item = await Inventory.findOne({ _id: itemId, salonId });
+      if (!item) continue;
+      const diff = physicalCount - item.stockLevel;
+      if (diff !== 0) {
+        const movement = await this.updateStock(
+          itemId,
+          Math.abs(diff),
+          diff > 0 ? "add" : "remove",
+          "Stock count adjustment",
+          salonId,
+          userId
+        );
+        adjustments.push(movement);
+      }
+    }
+    return adjustments;
+  }
 
-// METHOD: managePurchaseOrderWorkflow(orderId, action, userId)
-// - Handle purchase order approval workflows
-// - Support multi-level approval processes
-// - Track approval status and pending orders
-// - Send notifications to approvers and stakeholders
-// - Maintain audit trail of order modifications
-// - Handle order cancellations and modifications
+  async setReorderPoints(itemId, minStock, maxStock, reorderQty) {
+    return await Inventory.findByIdAndUpdate(
+      itemId,
+      { minStock, maxStock, reorderQuantity: reorderQty, updatedAt: new Date() },
+      { new: true }
+    );
+  }
 
-// ========================================
-// STEP 7: ✅ PRODUCT USAGE TRACKING
-// ========================================
+  // Automatic reordering
+  async checkAndCreateReorders(salonId) {
+    const lowStockItems = await Inventory.find({
+      tenantId: salonId,
+      stockLevel: { $lte: { $expr: "$minStock" } },
+      autoReorder: true
+    });
 
-// METHOD: trackServiceUsage(appointmentId, serviceId, usedProducts)
-// - Record product usage during service delivery
-// - Link product consumption to specific appointments
-// - Calculate service costs and profitability
-// - Update inventory levels based on usage
-// - Track product consumption patterns
-// - Generate service cost analysis reports
+    const reorders = [];
+    for (const item of lowStockItems) {
+      if (item.supplierId && item.reorderQuantity > 0) {
+        const po = await this.createPurchaseOrder(salonId, {
+          supplierId: item.supplierId,
+          items: [{ itemId: item._id, quantity: item.reorderQuantity, unitPrice: item.costPrice }],
+          type: 'auto-reorder'
+        }, 'system');
+        reorders.push(po);
+      }
+    }
+    return reorders;
+  }
 
-// METHOD: calculateServiceCosts(serviceId, salonId)
-// - Calculate accurate service delivery costs
-// - Include product costs and labor expenses
-// - Factor in overhead and operational costs
-// - Track cost trends over time
-// - Identify cost optimization opportunities
-// - Generate service profitability analysis
+  sendLowStockAlert(item) {
+    this.sendNotification(`LOW STOCK ALERT: ${item.name} - Current: ${item.stockLevel}, Min: ${item.minStock}`);
+  }
 
-// METHOD: analyzeProductUsage(salonId, period)
-// - Analyze product consumption patterns
-// - Identify high and low usage products
-// - Track usage efficiency and waste
-// - Generate usage forecasts and predictions
-// - Optimize inventory levels based on usage
-// - Identify training needs for product efficiency
+  // ==============================
+  // SUPPLIER & PURCHASE ORDERS
+  // ==============================
 
-// METHOD: generateUsageReports(salonId, reportType, period)
-// - Create detailed product usage reports
-// - Include service-specific consumption analysis
-// - Track seasonal usage patterns and trends
-// - Generate cost per service calculations
-// - Provide waste reduction recommendations
-// - Export usage data for further analysis
+  async manageSuppliers(salonId, supplierData) {
+    const supplier = new Supplier({ ...supplierData, tenantId: salonId });
+    await supplier.save();
+    this.sendNotification(`Supplier added: ${supplier.name}`);
+    return supplier;
+  }
 
-// ========================================
-// STEP 8: ✅ INVENTORY OPTIMIZATION
-// ========================================
+  async getSuppliers(salonId) {
+    return await Supplier.find({ tenantId: salonId }).sort({ name: 1 });
+  }
 
-// METHOD: optimizeInventoryLevels(salonId, optimizationCriteria)
-// - Analyze and optimize inventory stock levels
-// - Balance carrying costs with service availability
-// - Consider seasonal demand and usage patterns
-// - Optimize reorder points and quantities
-// - Reduce dead stock and obsolete inventory
-// - Generate optimization recommendations
+  async createPurchaseOrder(salonId, orderData, userId) {
+    const poNumber = await this.generatePONumber(salonId);
+    const totalAmount = orderData.items.reduce((sum, item) => sum + (item.quantity * item.unitPrice), 0);
 
-// METHOD: forecastInventoryDemand(salonId, forecastPeriod)
-// - Predict future inventory requirements
-// - Use historical usage and seasonal patterns
-// - Factor in business growth and trends
-// - Consider promotional and marketing activities
-// - Generate demand forecasts by product and category
-// - Provide procurement planning recommendations
+    const po = new PurchaseOrder({
+      ...orderData,
+      tenantId: salonId,
+      poNumber,
+      totalAmount,
+      createdBy: userId,
+      status: "pending",
+      createdAt: new Date(),
+    });
+    await po.save();
+    this.sendNotification(`Purchase order created: ${po.poNumber}`);
+    return po;
+  }
 
-// METHOD: identifySlowMovingStock(salonId, criteria)
-// - Identify products with low turnover rates
-// - Calculate inventory aging and obsolescence risk
-// - Generate markdown and clearance recommendations
-// - Track slow-moving stock trends
-// - Provide inventory liquidation strategies
-// - Calculate carrying cost implications
+  async generatePONumber(salonId) {
+    const count = await PurchaseOrder.countDocuments({ tenantId: salonId });
+    return `PO-${new Date().getFullYear()}-${String(count + 1).padStart(4, '0')}`;
+  }
 
-// METHOD: optimizePurchasingStrategy(salonId, optimizationGoals)
-// - Develop optimal purchasing strategies
-// - Balance bulk discounts with carrying costs
-// - Optimize order frequencies and quantities
-// - Negotiate better supplier terms and pricing
-// - Reduce procurement costs and lead times
-// - Generate strategic purchasing recommendations
+  async receivePurchaseOrder(orderId, receivingData, userId) {
+    const po = await PurchaseOrder.findById(orderId);
+    if (!po) throw new Error("Purchase order not found");
 
-// ========================================
-// STEP 9: ✅ INVENTORY ALERTS AND NOTIFICATIONS
-// ========================================
+    po.status = "received";
+    po.receivedAt = new Date();
+    po.receivedBy = userId;
+    await po.save();
 
-// METHOD: generateInventoryAlerts(salonId)
-// - Create automated inventory alerts and notifications
-// - Monitor stock levels and reorder points
-// - Alert for expiring products and obsolete stock
-// - Notify of supplier delivery delays
-// - Track inventory value fluctuations
-// - Send alerts via email, SMS, or dashboard
+    for (const { itemId, quantity, actualCost } of receivingData) {
+      await this.updateStock(itemId, quantity, "add", `Purchase received - PO: ${po.poNumber}`, po.tenantId, userId);
 
-// METHOD: sendReorderNotifications(salonId, urgencyLevel)
-// - Send reorder notifications to procurement team
-// - Include recommended quantities and suppliers
-// - Prioritize notifications by urgency and impact
-// - Track notification delivery and responses
-// - Follow up on overdue reorders
-// - Generate reorder status reports
+      // Update item cost if provided
+      if (actualCost) {
+        await Inventory.findByIdAndUpdate(itemId, { costPrice: actualCost });
+      }
+    }
 
-// METHOD: alertForExpiringProducts(salonId, daysBeforeExpiry)
-// - Monitor product expiration dates
-// - Send early warnings for expiring products
-// - Generate expiry reports and action plans
-// - Track product shelf life and rotation
-// - Implement FIFO (First In, First Out) procedures
-// - Reduce waste from expired products
+    this.sendNotification(`Purchase order received: ${po.poNumber}`);
+    return po;
+  }
 
-// ========================================
-// STEP 10: ✅ INVENTORY REPORTING AND EXPORT
-// ========================================
+  async getPurchaseOrders(salonId, status = null) {
+    const query = { tenantId: salonId };
+    if (status) query.status = status;
 
-// METHOD: generateStockReport(salonId, reportType)
-// - Create comprehensive stock status reports
-// - Include current stock levels and values
-// - Show stock movements and transactions
-// - Generate reports by category, supplier, or location
-// - Include visual charts and analytics
-// - Export reports in multiple formats (PDF, Excel, CSV)
+    return await PurchaseOrder.find(query)
+      .populate('supplierId', 'name')
+      .sort({ createdAt: -1 });
+  }
 
-// METHOD: generateInventoryMovementReport(salonId, period)
-// - Create detailed inventory movement reports
-// - Track all stock ins and outs during period
-// - Include movement reasons and responsible users
-// - Show movement patterns and trends
-// - Calculate movement velocity and frequency
-// - Generate movement analysis and insights
+  // ==============================
+  // PRODUCT USAGE TRACKING
+  // ==============================
 
-// METHOD: exportInventoryData(salonId, exportOptions)
-// - Export inventory data in various formats
-// - Support filtered exports based on criteria
-// - Include product images and documentation
-// - Generate barcode labels and reports
-// - Support integration with external systems
-// - Maintain data export audit trails
+  async trackServiceUsage(appointmentId, serviceId, usedProducts) {
+    for (const { itemId, quantity } of usedProducts) {
+      await this.updateStock(itemId, quantity, "remove", `Used in service ${serviceId}`, null, null);
+    }
+    this.sendNotification(`Products used for service ${serviceId} in appointment ${appointmentId}`);
+    return usedProducts;
+  }
 
-// ========================================
-// STEP 11: ✅ BARCODE AND PRODUCT IDENTIFICATION
-// ========================================
+  async calculateServiceCosts(serviceId) {
+    const service = await Service.findById(serviceId).populate("productsUsed");
+    if (!service) return { serviceId, totalCost: 0 };
 
-// METHOD: generateBarcodes(items, barcodeType)
-// - Generate barcodes for inventory items
-// - Support multiple barcode formats (UPC, EAN, Code128)
-// - Create printable barcode labels
-// - Link barcodes to inventory management system
-// - Generate batch barcode creation
-// - Maintain barcode registry and uniqueness
+    let totalCost = 0;
+    if (service.productsUsed) {
+      service.productsUsed.forEach(prod => totalCost += (prod.costPrice || 0));
+    }
+    return { serviceId, totalCost, margin: service.price - totalCost };
+  }
 
-// METHOD: scanBarcodeForInventory(barcode, salonId)
-// - Process barcode scans for inventory operations
-// - Retrieve product information from barcode
-// - Support quick stock updates via barcode scanning
-// - Validate barcode format and integrity
-// - Track barcode scan history and usage
-// - Handle barcode errors and exceptions
+  async analyzeProductUsage(salonId, startDate = null, endDate = null) {
+    const matchQuery = { tenantId: salonId, type: 'remove' };
+    if (startDate && endDate) {
+      matchQuery.createdAt = { $gte: startDate, $lte: endDate };
+    }
 
-// METHOD: manageProductImages(itemId, imageData, salonId)
-// - Upload and manage product images
-// - Resize and optimize images for storage
-// - Generate thumbnail and display versions
-// - Link images to inventory items
-// - Support multiple images per product
-// - Implement image versioning and history
+    const usage = await InventoryMovement.aggregate([
+      { $match: matchQuery },
+      {
+        $group: {
+          _id: "$itemId",
+          totalUsed: { $sum: { $abs: "$quantity" } },
+          usageCount: { $sum: 1 }
+        }
+      },
+      { $lookup: { from: "inventories", localField: "_id", foreignField: "_id", as: "item" } },
+      { $unwind: "$item" },
+      {
+        $project: {
+          itemName: "$item.name",
+          totalUsed: 1,
+          usageCount: 1,
+          totalCost: { $multiply: ["$totalUsed", "$item.costPrice"] }
+        }
+      },
+      { $sort: { totalUsed: -1 } }
+    ]);
 
-// ========================================
-// STEP 12: ✅ INTEGRATION AND DATA IMPORT/EXPORT
-// ========================================
+    return usage;
+  }
 
-// METHOD: importInventoryData(salonId, importData, importOptions)
-// - Import inventory data from external sources
-// - Support CSV, Excel, and API data imports
-// - Validate imported data for completeness
-// - Map imported fields to system structure
-// - Handle duplicate items and conflicts
-// - Generate import reports and error logs
+  // ==============================
+  // NOTIFICATIONS
+  // ==============================
+  
+  sendNotification(message) {
+    console.log(`Inventory Notification: ${message}`);
+  }
 
-// METHOD: syncWithExternalSystems(salonId, systemType, syncOptions)
-// - Synchronize inventory with external systems
-// - Support accounting software integration
-// - Connect with supplier inventory systems
-// - Handle real-time data synchronization
-// - Resolve data conflicts and discrepancies
-// - Maintain sync logs and status tracking
+  // ==============================
+  // ANALYTICS
+  // ==============================
 
-// METHOD: integrateWithPOS(salonId, posSystem, integrationSettings)
-// - Integrate inventory with Point of Sale systems
-// - Sync product information and pricing
-// - Update stock levels from sales transactions
-// - Handle real-time inventory updates
-// - Support multiple POS system types
-// - Maintain data consistency across systems
+  async getInventoryAnalytics(salonId, startDate = null, endDate = null) {
+    const query = { tenantId: salonId };
 
-// ========================================
-// STEP 13: ✅ COST MANAGEMENT AND ANALYSIS
-// ========================================
+    const totalItems = await Inventory.countDocuments(query);
+    const lowStock = await Inventory.countDocuments({
+      ...query,
+      $expr: { $lte: ["$stockLevel", "$minStock"] }
+    });
+    const outOfStock = await Inventory.countDocuments({ ...query, stockLevel: 0 });
 
-// METHOD: calculateInventoryCosts(salonId, costMethod)
-// - Calculate comprehensive inventory costs
-// - Include purchase costs, shipping, and handling
-// - Factor in storage and carrying costs
-// - Calculate cost per unit and total value
-// - Track cost trends and variations
-// - Generate cost analysis reports
+    // Calculate total inventory value
+    const inventoryValue = await Inventory.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: null,
+          totalValue: { $sum: { $multiply: ["$stockLevel", "$costPrice"] } }
+        }
+      }
+    ]);
 
-// METHOD: analyzeProfitability(salonId, period)
-// - Analyze inventory profitability and margins
-// - Calculate gross profit by product and category
-// - Identify high and low margin products
-// - Track profitability trends over time
-// - Generate profitability optimization recommendations
-// - Compare actual vs planned profitability
+    // Movement analytics
+    const movementQuery = { tenantId: salonId };
+    if (startDate && endDate) {
+      movementQuery.createdAt = { $gte: startDate, $lte: endDate };
+    }
 
-// METHOD: trackInventoryMetrics(salonId, metricType)
-// - Track key inventory performance metrics
-// - Monitor inventory turnover and velocity
-// - Calculate service level and stockout rates
-// - Track order accuracy and delivery performance
-// - Measure inventory carrying costs
-// - Generate KPI dashboards and reports
+    const movements = await InventoryMovement.aggregate([
+      { $match: movementQuery },
+      {
+        $group: {
+          _id: "$type",
+          count: { $sum: 1 },
+          totalQuantity: { $sum: { $abs: "$quantity" } }
+        }
+      }
+    ]);
 
-// ========================================
-// STEP 14: ✅ ERROR HANDLING AND VALIDATION
-// ========================================
+    return {
+      totalItems,
+      lowStock,
+      outOfStock,
+      totalValue: inventoryValue[0]?.totalValue || 0,
+      movements: movements.reduce((acc, m) => {
+        acc[m._id] = { count: m.count, quantity: m.totalQuantity };
+        return acc;
+      }, {})
+    };
+  }
 
-// Implement comprehensive error handling for:
-// - Invalid inventory data and stock movements
-// - Supplier integration and communication failures
-// - Barcode scanning and generation errors
-// - File import/export failures
-// - Stock level calculation errors
-// - Purchase order processing failures
-// - System integration and synchronization errors
+  // Get low stock items
+  async getLowStockItems(salonId) {
+    return await Inventory.find({
+      tenantId: salonId,
+      $expr: { $lte: ["$stockLevel", "$minStock"] }
+    }).sort({ stockLevel: 1 });
+  }
 
-// ========================================
-// STEP 15: ✅ EXPORT SERVICE INSTANCE
-// ========================================
+  // Get inventory valuation report
+  async getInventoryValuation(salonId) {
+    return await Inventory.aggregate([
+      { $match: { tenantId: salonId } },
+      {
+        $project: {
+          name: 1,
+          sku: 1,
+          stockLevel: 1,
+          costPrice: 1,
+          totalValue: { $multiply: ["$stockLevel", "$costPrice"] }
+        }
+      },
+      { $sort: { totalValue: -1 } }
+    ]);
+  }
+}
 
-// Create and export new instance of InventoryService
-// Initialize barcode generation and scanning services
-// Set up supplier communication channels
-// Configure inventory analytics and forecasting
-// Initialize file processing and image management
-// Set up integration connectors and data sync
+// Export service instance
+module.exports = new InventoryService();

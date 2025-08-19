@@ -20,49 +20,72 @@ class CustomerService {
   // ==================================
   
   async getCustomers(salonId, filters = {}, page = 1, limit = 10) {
-    const query = { salonId, ...filters };
+    const query = { tenantId: salonId, ...filters };
+
+    // Add search functionality
+    if (filters.search) {
+      query.$or = [
+        { name: { $regex: filters.search, $options: 'i' } },
+        { email: { $regex: filters.search, $options: 'i' } },
+        { phone: { $regex: filters.search, $options: 'i' } }
+      ];
+      delete query.search;
+    }
+
     const customers = await Customer.find(query)
       .sort({ lastVisit: -1 })
       .skip((page - 1) * limit)
       .limit(limit);
     const total = await Customer.countDocuments(query);
+
     return {
       customers,
       meta: {
         page,
         limit,
         totalPages: Math.ceil(total / limit),
-        total
+        total,
+        hasNextPage: page * limit < total,
+        hasPrevPage: page > 1
       }
     };
   }
 
   async getCustomerById(customerId, salonId) {
-    return await Customer.findOne({ _id: customerId, salonId })
-      .populate("appointments")
-      .populate("loyalty")
-      .populate("walletTransactions")
-      .populate("invoices");
+    return await Customer.findOne({ _id: customerId, tenantId: salonId });
   }
 
   async createCustomer(customerData, salonId) {
-    const exists = await Customer.findOne({ $or: [{ email: customerData.email }, { phone: customerData.phone }], salonId });
+    const exists = await Customer.findOne({
+      $or: [{ email: customerData.email }, { phone: customerData.phone }],
+      tenantId: salonId
+    });
     if (exists) throw new Error("Customer already exists");
-    
-    const customer = new Customer({ ...customerData, salonId, createdAt: new Date() });
-    await customer.save();
-    
-    // Initialize wallet and loyalty
-    customer.walletBalance = 0;
-    customer.loyaltyPoints = 0;
+
+    const customer = new Customer({
+      ...customerData,
+      tenantId: salonId,
+      walletBalance: 0,
+      loyaltyPoints: 0,
+      totalVisits: 0,
+      totalSpent: 0,
+      createdAt: new Date()
+    });
     await customer.save();
 
-    // TODO: Send welcome notification
     return customer;
   }
 
   async updateCustomer(customerId, updateData, salonId) {
-    return await Customer.findOneAndUpdate({ _id: customerId, salonId }, updateData, { new: true });
+    return await Customer.findOneAndUpdate(
+      { _id: customerId, tenantId: salonId },
+      updateData,
+      { new: true }
+    );
+  }
+
+  async deleteCustomer(customerId, salonId) {
+    return await Customer.findOneAndDelete({ _id: customerId, tenantId: salonId });
   }
 
   // ==================================
@@ -115,27 +138,48 @@ class CustomerService {
 
   async calculateLoyaltyPoints(customerId, purchaseAmount) {
     const customer = await Customer.findById(customerId);
-    const pointsEarned = Math.floor(purchaseAmount); // Simple example
+    const pointsEarned = Math.floor(purchaseAmount / 10); // 1 point per $10 spent
     customer.loyaltyPoints += pointsEarned;
+    customer.totalSpent = (customer.totalSpent || 0) + purchaseAmount;
+
+    // Update loyalty tier
+    await this.updateLoyaltyTier(customerId);
     await customer.save();
+
     return pointsEarned;
   }
 
-  async redeemLoyaltyPoints(customerId, pointsToRedeem, type) {
+  async redeemLoyaltyPoints(customerId, pointsToRedeem, rewardType = 'discount') {
     const customer = await Customer.findById(customerId);
     if (customer.loyaltyPoints < pointsToRedeem) throw new Error("Insufficient points");
 
     customer.loyaltyPoints -= pointsToRedeem;
     await customer.save();
 
-    // TODO: Create redemption record
-    return { redeemedPoints: pointsToRedeem };
+    // Create redemption record
+    const redemption = new WalletTransaction({
+      userId: customerId,
+      type: 'loyalty_redemption',
+      amount: pointsToRedeem,
+      description: `Redeemed ${pointsToRedeem} points for ${rewardType}`,
+      metadata: { rewardType, pointsRedeemed: pointsToRedeem }
+    });
+    await redemption.save();
+
+    return { redeemedPoints: pointsToRedeem, rewardType };
   }
 
   async updateLoyaltyTier(customerId) {
     const customer = await Customer.findById(customerId);
-    // TODO: Calculate tier based on spending or visits
-    return customer.loyaltyTier;
+    const totalSpent = customer.totalSpent || 0;
+
+    let newTier = 'Bronze';
+    if (totalSpent >= 1000) newTier = 'Gold';
+    else if (totalSpent >= 500) newTier = 'Silver';
+
+    customer.loyaltyTier = newTier;
+    await customer.save();
+    return newTier;
   }
 
   async getLoyaltyStatus(customerId) {
@@ -200,24 +244,76 @@ class CustomerService {
   // CUSTOMER ANALYTICS & SEGMENTATION
   // ==================================
 
-  async getCustomerAnalytics(salonId, period) {
-    // TODO: Generate customer analytics
-    return {};
+  async getCustomerAnalytics(salonId, startDate = null, endDate = null) {
+    const query = { tenantId: salonId };
+    if (startDate && endDate) {
+      query.createdAt = { $gte: startDate, $lte: endDate };
+    }
+
+    const analytics = await Customer.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: null,
+          totalCustomers: { $sum: 1 },
+          avgTotalSpent: { $avg: "$totalSpent" },
+          avgVisits: { $avg: "$totalVisits" },
+          avgLoyaltyPoints: { $avg: "$loyaltyPoints" }
+        }
+      }
+    ]);
+
+    const tierDistribution = await Customer.aggregate([
+      { $match: query },
+      { $group: { _id: "$loyaltyTier", count: { $sum: 1 } } }
+    ]);
+
+    return {
+      summary: analytics[0] || { totalCustomers: 0, avgTotalSpent: 0, avgVisits: 0, avgLoyaltyPoints: 0 },
+      tierDistribution
+    };
   }
 
-  async segmentCustomers(salonId, criteria) {
-    // TODO: Segment customers
-    return [];
+  async segmentCustomers(salonId, criteria = 'spending') {
+    const query = { tenantId: salonId };
+
+    switch (criteria) {
+      case 'spending':
+        return await Customer.find(query).sort({ totalSpent: -1 });
+      case 'visits':
+        return await Customer.find(query).sort({ totalVisits: -1 });
+      case 'loyalty':
+        return await Customer.find(query).sort({ loyaltyPoints: -1 });
+      default:
+        return await Customer.find(query);
+    }
   }
 
   async identifyChurnRisk(salonId) {
-    // TODO: Detect at-risk customers
-    return [];
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    return await Customer.find({
+      tenantId: salonId,
+      lastVisit: { $lt: thirtyDaysAgo },
+      totalVisits: { $gte: 2 }
+    }).sort({ lastVisit: 1 });
   }
 
   async calculateCustomerLifetimeValue(customerId) {
-    // TODO: CLV calculation
-    return 0;
+    const customer = await Customer.findById(customerId);
+    if (!customer) return 0;
+
+    const appointments = await Appointment.find({
+      customerId,
+      status: 'completed'
+    });
+
+    const totalRevenue = appointments.reduce((sum, apt) => sum + (apt.totalAmount || 0), 0);
+    const avgOrderValue = totalRevenue / (appointments.length || 1);
+    const visitFrequency = appointments.length / 12; // visits per month
+
+    return parseFloat((avgOrderValue * visitFrequency * 24).toFixed(2)); // 2-year CLV
   }
 
   // ==================================

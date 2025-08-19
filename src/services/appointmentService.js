@@ -1,364 +1,320 @@
-/**
- * ======================================
- * APPOINTMENT SERVICE - SERVICE LAYER
- * ======================================
- *
- * This file handles all business logic for appointment management in the salon/spa system.
- * It manages booking, scheduling, availability, cancellations, and appointment-related analytics.
- *
- * Main Functions:
- * - Appointment CRUD operations (Create, Read, Update, Delete)
- * - Staff availability checking and scheduling
- * - Appointment status management (confirmed, completed, cancelled)
- * - Calendar integration and time slot management
- * - Appointment notifications and reminders
- * - Booking analytics and reporting
- */
+// ======================================
+// APPOINTMENT SERVICE - SERVICE LAYER
+// ======================================
+const Appointment = require("../models/appointment");
+const Staff = require("../models/staff");
+const Customer = require("../models/customer");
+const Service = require("../models/service");
+//in notifiction Currently it just console.log(). Later you could integrate SMS, email, or push notifications.
+// Utility for date/time handling
+const { addMinutes, format, startOfDay, endOfDay, subHours, subDays } = require("date-fns");
 
-// ========================================
-// STEP 1: ✅ IMPORT REQUIRED MODULES AND DEPENDENCIES
-// ========================================
-// Import database models for appointment management
-// - Appointment model for main appointment operations
-// - Customer model for customer information
-// - Staff model for staff availability and scheduling
-// - Service model for service details and pricing
-// - Salon model for salon-specific settings
+class AppointmentService {
+  // ==============================
+  // APPOINTMENT RETRIEVAL
+  // ==============================
+  
+  async getAppointments(salonId, filters = {}, page = 1, limit = 10, search = null) {
+    const query = { tenantId: salonId, ...filters };
 
-// Import date/time manipulation libraries (moment.js or date-fns)
-// Import calendar utilities for scheduling
-// Import notification services for appointment reminders
-// Import email/SMS services for communication
-// Import validation utilities for appointment data
+    // Add search functionality
+    if (search) {
+      const searchRegex = { $regex: search, $options: 'i' };
+      query.$or = [
+        { notes: searchRegex },
+        { internalNotes: searchRegex },
+        { cancelReason: searchRegex }
+      ];
+    }
 
-// ========================================
-// STEP 2: ✅ CREATE APPOINTMENT SERVICE CLASS
-// ========================================
-// Define AppointmentService class to encapsulate all appointment methods
-// Initialize class with proper error handling and logging
-// Set up connection to notification services
-// Configure timezone handling for appointment scheduling
+    const appointments = await Appointment.find(query)
+      .populate("customerId", "name email phone")
+      .populate("staffId", "name email specialties")
+      .populate("serviceIds", "name duration price")
+      .populate("createdBy", "name")
+      .populate("updatedBy", "name")
+      .sort({ scheduledAt: 1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
 
-// ========================================
-// STEP 3: ✅ APPOINTMENT RETRIEVAL METHODS
-// ========================================
+    const total = await Appointment.countDocuments(query);
 
-// METHOD: getAppointments(salonId, filters, pagination)
-// - Retrieve appointments with advanced filtering options
-// - Support filters: status, date range, staff member, customer, service type
-// - Implement pagination for large appointment lists
-// - Include population of related data (customer, staff, services)
-// - Sort appointments by date and time
-// - Return paginated results with metadata
+    return {
+      appointments,
+      meta: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        totalPages: Math.ceil(total / limit),
+        total,
+        hasNextPage: page * limit < total,
+        hasPrevPage: page > 1
+      },
+    };
+  }
 
-// METHOD: getAppointmentById(appointmentId, salonId)
-// - Fetch single appointment by ID with full details
-// - Validate salon ownership and permissions
-// - Populate all related information (customer, staff, services)
-// - Include appointment history and status changes
-// - Handle not found scenarios gracefully
+  async getAppointmentById(appointmentId, salonId) {
+    return await Appointment.findOne({ _id: appointmentId, tenantId: salonId })
+      .populate("customerId")
+      .populate("staffId")
+      .populate("serviceIds");
+  }
 
-// METHOD: getAppointmentsByDateRange(salonId, startDate, endDate)
-// - Retrieve appointments within specific date range
-// - Optimize for calendar views and scheduling
-// - Group appointments by date for better organization
-// - Include staff availability information
-// - Support timezone conversions
+  async getAppointmentsByDateRange(salonId, startDate, endDate) {
+    return await Appointment.find({
+      tenantId: salonId,
+      scheduledAt: { $gte: startDate, $lte: endDate },
+    })
+      .populate("customerId")
+      .populate("staffId")
+      .populate("serviceIds")
+      .sort({ scheduledAt: 1 });
+  }
 
-// METHOD: getTodaysAppointments(salonId)
-// - Get all appointments for current day
-// - Include upcoming, in-progress, and completed appointments
-// - Sort by appointment time
-// - Add real-time status updates
-// - Support staff-specific filtering
+  async getTodaysAppointments(salonId) {
+    const today = new Date();
+    const start = new Date(today.setHours(0, 0, 0, 0));
+    const end = new Date(today.setHours(23, 59, 59, 999));
+    return this.getAppointmentsByDateRange(salonId, start, end);
+  }
 
-// ========================================
-// STEP 4: ✅ APPOINTMENT CREATION AND BOOKING
-// ========================================
+  // ==============================
+  // APPOINTMENT CREATION
+  // ==============================
+  
+  async createAppointment(data) {
+    // Check staff availability
+    const available = await this.checkStaffAvailability(
+      data.staffId,
+      data.scheduledAt,
+      data.duration || 60
+    );
+    if (!available) throw new Error("Staff not available at this time.");
 
-// METHOD: createAppointment(appointmentData)
-// - Validate appointment data thoroughly
-// - Check customer information and requirements
-// - Verify service availability and pricing
-// - Validate staff availability for requested time slot
-// - Calculate total duration and pricing automatically
-// - Handle service bundling and packages
-// - Generate unique appointment confirmation number
-// - Send confirmation notifications to customer and staff
-// - Create calendar entries and reminders
+    // Create appointment
+    const appointment = new Appointment({
+      ...data,
+      status: "booked",
+    });
 
-// METHOD: bookWalkInAppointment(appointmentData)
-// - Handle immediate walk-in bookings
-// - Find available staff for requested services
-// - Check real-time availability
-// - Create quick booking with minimal data
-// - Update salon capacity and scheduling
+    await appointment.save();
+    this.sendNotification(appointment, "Appointment confirmed!");
+    return appointment;
+  }
 
-// METHOD: createRecurringAppointment(appointmentData, recurrencePattern)
-// - Set up recurring appointments (weekly, monthly, etc.)
-// - Validate recurring pattern and availability
-// - Create series of appointments with proper spacing
-// - Handle exceptions and modifications to series
-// - Manage recurring appointment notifications
+  async updateAppointment(appointmentId, updateData, salonId) {
+    if (updateData.scheduledAt && updateData.staffId) {
+      const available = await this.checkStaffAvailability(
+        updateData.staffId,
+        updateData.scheduledAt,
+        updateData.duration || 60,
+        appointmentId
+      );
+      if (!available) throw new Error("Staff not available at this time.");
+    }
+    const appointment = await Appointment.findOneAndUpdate(
+      { _id: appointmentId, tenantId: salonId },
+      updateData,
+      { new: true }
+    );
+    this.sendNotification(appointment, "Appointment updated!");
+    return appointment;
+  }
 
-// ========================================
-// STEP 5: ✅ APPOINTMENT MODIFICATION AND UPDATES
-// ========================================
+  async updateAppointmentStatus(appointmentId, status, salonId) {
+    const appointment = await Appointment.findOneAndUpdate(
+      { _id: appointmentId, tenantId: salonId },
+      { status },
+      { new: true }
+    );
+    this.sendNotification(appointment, `Status updated to ${status}`);
+    return appointment;
+  }
 
-// METHOD: updateAppointment(appointmentId, updateData, salonId)
-// - Modify existing appointment details
-// - Validate new time slot availability if time is changed
-// - Recalculate pricing if services are modified
-// - Handle staff reassignment with availability checks
-// - Update duration based on service changes
-// - Send update notifications to all parties
-// - Maintain appointment history and audit trail
+  async cancelAppointment(appointmentId, reason, salonId) {
+    const appointment = await Appointment.findOneAndUpdate(
+      { _id: appointmentId, tenantId: salonId },
+      { status: "cancelled", cancelReason: reason },
+      { new: true }
+    );
+    this.sendNotification(appointment, `Appointment cancelled: ${reason}`);
+    return appointment;
+  }
 
-// METHOD: rescheduleAppointment(appointmentId, newDateTime, salonId)
-// - Move appointment to different date/time
-// - Check availability for new time slot
-// - Validate staff working hours and availability
-// - Handle conflicts with existing appointments
-// - Send rescheduling notifications
-// - Update calendar entries and reminders
+  async deleteAppointment(appointmentId, salonId) {
+    return await Appointment.findOneAndDelete({ _id: appointmentId, tenantId: salonId });
+  }
 
-// METHOD: updateAppointmentStatus(appointmentId, status, salonId)
-// - Change appointment status (confirmed, in-progress, completed, cancelled)
-// - Validate status transitions and business rules
-// - Update staff schedule and availability
-// - Trigger status-specific actions (billing, notifications)
-// - Log status change history
+  async handleNoShow(appointmentId, salonId) {
+    const appointment = await Appointment.findOneAndUpdate(
+      { _id: appointmentId, tenantId: salonId },
+      { status: "no-show" },
+      { new: true }
+    );
+    this.sendNotification(appointment, "Customer no-show");
+    return appointment;
+  }
 
-// ========================================
-// STEP 6: ✅ APPOINTMENT CANCELLATION AND DELETION
-// ========================================
+  // ==============================
+  // STAFF AVAILABILITY
+  // ==============================
+  
+  async checkStaffAvailability(staffId, scheduledAt, duration = 60, excludeAppointmentId = null) {
+    const start = new Date(scheduledAt);
+    const end = addMinutes(start, duration);
 
-// METHOD: cancelAppointment(appointmentId, reason, salonId)
-// - Cancel appointment with proper reason tracking
-// - Handle cancellation policies and fees
-// - Update staff availability and schedule
-// - Send cancellation notifications
-// - Process refunds if applicable
-// - Update customer booking history
+    const overlapping = await Appointment.findOne({
+      staffId,
+      _id: { $ne: excludeAppointmentId },
+      scheduledAt: { $lt: end, $gte: start },
+      status: { $in: ["booked", "in-progress"] },
+    });
 
-// METHOD: deleteAppointment(appointmentId, salonId)
-// - Permanently remove appointment from system
-// - Validate deletion permissions and policies
-// - Clean up related data and references
-// - Update staff schedules and availability
-// - Maintain audit logs for compliance
+    return !overlapping;
+  }
 
-// METHOD: handleNoShow(appointmentId, salonId)
-// - Mark appointment as no-show
-// - Apply no-show policies and fees
-// - Update customer reliability scoring
-// - Send follow-up communications
-// - Free up staff time for other bookings
+  async getAvailableTimeSlots(salonId, date, serviceDuration = 60, staffId = null) {
+    const staffQuery = { tenantId: salonId };
+    if (staffId) staffQuery._id = staffId;
 
-// ========================================
-// STEP 7: ✅ STAFF AVAILABILITY AND SCHEDULING
-// ========================================
+    const staffList = await Staff.find(staffQuery);
+    const slots = [];
 
-// METHOD: checkStaffAvailability(staffId, date, time, duration, excludeAppointmentId?)
-// - Verify if staff member is available for specific time slot
-// - Check working hours and break times
-// - Validate against existing appointments
-// - Consider travel time between appointments
-// - Handle special availability rules and preferences
-// - Check for holidays and time-off requests
+    for (const staff of staffList) {
+      let current = new Date(date);
+      current.setHours(9, 0, 0, 0);
+      const endOfDay = new Date(date);
+      endOfDay.setHours(18, 0, 0, 0);
 
-// METHOD: getAvailableTimeSlots(salonId, date, serviceId, staffId?)
-// - Generate list of available booking slots for given date
-// - Consider service duration and requirements
-// - Factor in staff working hours and existing bookings
-// - Apply business rules for booking windows
-// - Support specific staff or auto-assignment
+      while (current < endOfDay) {
+        const available = await this.checkStaffAvailability(staff._id, current, serviceDuration);
+        if (available) {
+          slots.push({
+            staffId: staff._id,
+            staffName: staff.name,
+            time: new Date(current)
+          });
+        }
+        current = addMinutes(current, 30);
+      }
+    }
+    return slots;
+  }
 
-// METHOD: getStaffSchedule(staffId, dateRange)
-// - Retrieve complete staff schedule for date range
-// - Include appointments, breaks, and availability
-// - Show blocked time and unavailable periods
-// - Support calendar integration formats
-// - Include overtime and capacity information
+  // Calendar view for appointments
+  async getCalendarView(salonId, startDate, endDate, staffId = null) {
+    const query = {
+      tenantId: salonId,
+      scheduledAt: { $gte: startDate, $lte: endDate }
+    };
+    if (staffId) query.staffId = staffId;
 
-// METHOD: optimizeStaffScheduling(salonId, date)
-// - Suggest optimal staff assignments for maximum efficiency
-// - Balance workload across available staff
-// - Minimize gaps and maximize utilization
-// - Consider staff skills and service requirements
-// - Provide scheduling recommendations
+    return await Appointment.find(query)
+      .populate("customerId", "name")
+      .populate("staffId", "name")
+      .populate("serviceIds", "name duration")
+      .sort({ scheduledAt: 1 });
+  }
 
-// ========================================
-// STEP 8: ✅ SERVICE AND PRICING MANAGEMENT
-// ========================================
+  // Staff schedule for a specific date
+  async getStaffSchedule(staffId, date) {
+    const start = new Date(date);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(date);
+    end.setHours(23, 59, 59, 999);
 
-// METHOD: calculateAppointmentPricing(services, customizations)
-// - Calculate total cost for appointment services
-// - Apply service packages and bundles
-// - Handle customizations and add-ons
-// - Calculate taxes and fees
-// - Apply discounts and promotions
-// - Support loyalty program benefits
+    return await Appointment.find({
+      staffId,
+      scheduledAt: { $gte: start, $lte: end },
+      status: { $nin: ['cancelled', 'no-show'] }
+    }).sort({ scheduledAt: 1 });
+  }
 
-// METHOD: validateServiceCombinations(services)
-// - Check if selected services can be performed together
-// - Validate service dependencies and requirements
-// - Ensure proper sequencing of services
-// - Check for conflicting services or restrictions
-// - Suggest alternative combinations if needed
+  // ==============================
+  // NOTIFICATIONS
+  // ==============================
+  
+  async sendNotification(appointment, message) {
+    console.log(`Notification: ${message} for appointment ${appointment._id}`);
 
-// METHOD: estimateAppointmentDuration(services, customizations)
-// - Calculate total time needed for appointment
-// - Include setup and cleanup time
-// - Factor in service complexity and customizations
-// - Add buffer time for customer consultation
-// - Consider staff experience and efficiency
+    // Schedule reminders for new appointments
+    if (message.includes('confirmed')) {
+      await this.scheduleReminders(appointment);
+    }
+  }
 
-// ========================================
-// STEP 9: ✅ CUSTOMER MANAGEMENT INTEGRATION
-// ========================================
+  async scheduleReminders(appointment) {
+    try {
+      const scheduledAt = new Date(appointment.scheduledAt);
+      const now = new Date();
 
-// METHOD: getCustomerAppointmentHistory(customerId, salonId)
-// - Retrieve complete appointment history for customer
-// - Include past, current, and future appointments
-// - Show service preferences and patterns
-// - Calculate customer lifetime value
-// - Track customer satisfaction and feedback
+      // 24-hour reminder
+      const reminder24h = new Date(scheduledAt.getTime() - (24 * 60 * 60 * 1000));
+      if (reminder24h > now) {
+        console.log(`24h reminder scheduled for appointment ${appointment._id}`);
+      }
 
-// METHOD: suggestAppointmentForCustomer(customerId, salonId)
-// - Recommend appointments based on customer history
-// - Consider past service preferences
-// - Suggest optimal timing based on patterns
-// - Recommend additional services for cross-selling
-// - Factor in seasonal preferences and trends
+      // 2-hour reminder
+      const reminder2h = new Date(scheduledAt.getTime() - (2 * 60 * 60 * 1000));
+      if (reminder2h > now) {
+        console.log(`2h reminder scheduled for appointment ${appointment._id}`);
+      }
+    } catch (error) {
+      console.error('Failed to schedule reminders:', error);
+    }
+  }
 
-// METHOD: validateCustomerEligibility(customerId, serviceId)
-// - Check if customer meets service requirements
-// - Validate age restrictions and health considerations
-// - Check for allergies and contraindications
-// - Verify customer consent and waivers
-// - Ensure customer account is in good standing
+  // ==============================
+  // ANALYTICS
+  // ==============================
+  
+  async getAppointmentAnalytics(salonId, startDate = null, endDate = null) {
+    const dateFilter = {};
+    if (startDate && endDate) {
+      dateFilter.scheduledAt = { $gte: startDate, $lte: endDate };
+    }
 
-// ========================================
-// STEP 10: ✅ NOTIFICATION AND COMMUNICATION
-// ========================================
+    const baseQuery = { tenantId: salonId, ...dateFilter };
 
-// METHOD: sendAppointmentConfirmation(appointmentId)
-// - Send confirmation email/SMS to customer
-// - Include appointment details and instructions
-// - Provide calendar attachment for customer
-// - Send staff notification with customer details
-// - Include cancellation and rescheduling options
+    const totalAppointments = await Appointment.countDocuments(baseQuery);
+    const completed = await Appointment.countDocuments({ ...baseQuery, status: "completed" });
+    const cancelled = await Appointment.countDocuments({ ...baseQuery, status: "cancelled" });
+    const noShows = await Appointment.countDocuments({ ...baseQuery, status: "no-show" });
 
-// METHOD: sendAppointmentReminders(appointmentId, reminderType)
-// - Send automated reminders at configured intervals
-// - Support multiple reminder types (24h, 2h, 30min before)
-// - Customize reminder content based on service type
-// - Include preparation instructions for customer
-// - Allow easy confirmation or rescheduling
+    // Revenue calculation
+    const revenueData = await Appointment.aggregate([
+      { $match: { ...baseQuery, status: "completed" } },
+      { $group: { _id: null, totalRevenue: { $sum: "$totalAmount" } } }
+    ]);
 
-// METHOD: sendAppointmentUpdates(appointmentId, updateType)
-// - Notify all parties of appointment changes
-// - Handle rescheduling and modification notifications
-// - Send cancellation notifications with next steps
-// - Provide real-time status updates
-// - Include relevant contact information
+    return {
+      totalAppointments,
+      completed,
+      cancelled,
+      noShows,
+      completionRate: totalAppointments > 0 ? ((completed / totalAppointments) * 100).toFixed(2) : 0,
+      totalRevenue: revenueData[0]?.totalRevenue || 0
+    };
+  }
 
-// ========================================
-// STEP 11: ✅ ANALYTICS AND REPORTING
-// ========================================
+  // Reschedule appointment
+  async rescheduleAppointment(appointmentId, newScheduledAt, newStaffId, salonId) {
+    const appointment = await Appointment.findOne({ _id: appointmentId, tenantId: salonId });
+    if (!appointment) throw new Error("Appointment not found");
 
-// METHOD: getAppointmentAnalytics(salonId, period)
-// - Generate comprehensive appointment statistics
-// - Calculate booking rates and conversion metrics
-// - Analyze appointment patterns and trends
-// - Track popular services and time slots
-// - Measure staff utilization and performance
-// - Identify booking bottlenecks and opportunities
+    const staffId = newStaffId || appointment.staffId;
+    const available = await this.checkStaffAvailability(staffId, newScheduledAt, appointment.duration, appointmentId);
+    if (!available) throw new Error("Staff not available at requested time");
 
-// METHOD: getBookingTrends(salonId, period)
-// - Analyze booking patterns over time
-// - Identify peak and low-demand periods
-// - Track seasonal variations and trends
-// - Generate capacity planning insights
-// - Provide recommendations for optimization
+    const updated = await Appointment.findOneAndUpdate(
+      { _id: appointmentId, tenantId: salonId },
+      { scheduledAt: newScheduledAt, staffId, status: "rescheduled" },
+      { new: true }
+    );
 
-// METHOD: getAppointmentRevenue(salonId, period)
-// - Calculate revenue generated from appointments
-// - Break down revenue by services and staff
-// - Track average appointment value trends
-// - Analyze pricing effectiveness
-// - Identify revenue optimization opportunities
+    await this.sendNotification(updated, "Appointment rescheduled");
+    return updated;
+  }
+}
 
-// ========================================
-// STEP 12: ✅ CALENDAR AND INTEGRATION FEATURES
-// ========================================
-
-// METHOD: exportToCalendar(appointmentId, format)
-// - Generate calendar files (ICS, Google Calendar)
-// - Include all appointment details and location
-// - Set appropriate reminders and notifications
-// - Support recurring appointment exports
-// - Provide staff and customer calendar integration
-
-// METHOD: syncWithExternalCalendars(salonId)
-// - Integrate with Google Calendar, Outlook, etc.
-// - Sync staff availability and bookings
-// - Handle two-way calendar synchronization
-// - Manage calendar conflicts and updates
-// - Support multiple calendar systems
-
-// METHOD: generateTimeSlotMatrix(salonId, date)
-// - Create visual time slot availability matrix
-// - Show all staff availability in grid format
-// - Highlight booked and available slots
-// - Support drag-and-drop scheduling interface
-// - Include break times and unavailable periods
-
-// ========================================
-// STEP 13: ✅ BUSINESS RULES AND VALIDATION
-// ========================================
-
-// METHOD: validateBusinessRules(appointmentData)
-// - Enforce salon-specific booking policies
-// - Validate minimum advance booking requirements
-// - Check maximum appointments per customer per day
-// - Enforce service-specific restrictions
-// - Validate payment requirements and deposits
-
-// METHOD: applyBookingPolicies(appointmentData)
-// - Apply cancellation and rescheduling policies
-// - Enforce no-show fees and penalties
-// - Handle late arrival policies
-// - Apply seasonal pricing and availability rules
-// - Implement loyalty program benefits
-
-// METHOD: validateAppointmentConflicts(appointmentData)
-// - Check for scheduling conflicts
-// - Validate resource availability (rooms, equipment)
-// - Ensure adequate staffing for appointment
-// - Check for service compatibility issues
-// - Validate customer booking restrictions
-
-// ========================================
-// STEP 14: ✅ ERROR HANDLING AND LOGGING
-// ========================================
-
-// Implement comprehensive error handling for:
-// - Invalid appointment data and parameters
-// - Staff availability conflicts
-// - Service availability and pricing errors
-// - Customer validation failures
-// - Database transaction failures
-// - External integration errors
-// - Notification delivery failures
-
-// ========================================
-// STEP 15: ✅ EXPORT SERVICE INSTANCE
-// ========================================
-
-// Create and export new instance of AppointmentService
-// Include proper initialization and configuration
-// Set up database connections and external integrations
-// Configure logging and monitoring systems
-// Initialize notification services and calendar integrations
+// Export service instance
+module.exports = new AppointmentService();
